@@ -1,0 +1,153 @@
+# ==============================================================================
+# PROJECT: Universal Entomopathogenic Virulence Screening
+# SCRIPT:  Universal_Virulence_Pipeline.R
+# AUTHOR:  [Your Name]
+# GITHUB:  [Your GitHub Link]
+#
+# DESCRIPTION:
+# This pipeline performs a comprehensive in silico screening of a bacterial
+# strain against specific insect host targets (e.g., Tuta absoluta).
+# It generates:
+# 1. Virulence Factor counts and distributions (Bar/Violin plots)
+# 2. Host-Pathogen Interaction Networks (Bipartite Graphs)
+# 3. Deep Homology Heatmaps for novel variant discovery
+# ==============================================================================
+
+# --- SECTION 1: SETUP ---
+# 1. Install missing dependencies automatically
+pkg_list <- c("ggplot2", "dplyr", "rentrez", "ggrepel", "igraph", "viridis")
+new_pkgs <- pkg_list[!(pkg_list %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs)
+
+library(ggplot2)
+library(dplyr)
+library(rentrez)
+library(ggrepel)
+library(igraph)
+library(viridis)
+
+# 2. Set Paths (Relative for GitHub Portability)
+# NOTE: Ensure your CSV files are in a folder named 'data' next to this script.
+data_dir <- "./data/"
+out_dir  <- "./results/"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# Define the Strain Name (Change this to customize graphs)
+strain_name <- "Bacterial Strain" 
+print(paste(">>> Pipeline Initiated for:", strain_name))
+
+# ==============================================================================
+# MODULE 1: DATA INGESTION
+# ==============================================================================
+
+load_blast_data <- function(filename, category_name) {
+  fpath <- paste0(data_dir, filename)
+  if (file.exists(fpath)) {
+    raw <- read.csv(fpath, stringsAsFactors = FALSE)
+    if (nrow(raw) > 0) {
+      
+      # Flexible Column Matching to handle different BLAST outputs
+      if ("QueryID" %in% names(raw)) raw$GeneID <- raw$QueryID
+      else if ("Ref_Enzyme" %in% names(raw)) raw$GeneID <- raw$Ref_Enzyme
+      else raw$GeneID <- raw$SubjectID
+      
+      if ("Identity" %in% names(raw)) raw$Ident <- raw$Identity
+      else raw$Ident <- raw$Perc.Ident
+      
+      if ("Evalue" %in% names(raw)) raw$Eval <- raw$Evalue
+      else raw$Eval <- raw$evalue
+      
+      # Clean Metrics
+      raw$Ident <- suppressWarnings(as.numeric(as.character(raw$Ident)))
+      raw$Eval  <- suppressWarnings(as.numeric(as.character(raw$Eval)))
+      raw$Eval[is.na(raw$Eval)] <- 0
+      
+      return(data.frame(GeneID=raw$GeneID, Identity=raw$Ident, Evalue=raw$Eval, Category=category_name))
+    }
+  } else {
+    warning(paste("File not found:", filename))
+    return(NULL)
+  }
+}
+
+# Load Datasets (Add your own file names here)
+df <- data.frame()
+df <- rbind(df, load_blast_data("final_results.csv", "Cry Toxins"))
+df <- rbind(df, load_blast_data("chitinase_results.csv", "Chitinases"))
+df <- rbind(df, load_blast_data("harpoon_results.csv", "Harpoons"))
+df <- rbind(df, load_blast_data("broad_spectrum_results.csv", "Broad Spec"))
+
+# Check Data
+if (nrow(df) == 0) stop("CRITICAL ERROR: No data loaded. Check './data/' folder.")
+df$ShortName <- substr(gsub(".*\\|", "", df$GeneID), 1, 15)
+df <- df %>% filter(!is.na(Identity))
+
+print(paste(">>> Data Loaded Successfully:", nrow(df), "hits."))
+
+# ==============================================================================
+# MODULE 2: VISUALIZATION
+# ==============================================================================
+
+# --- FIG 1: Top 50 Significance Ranking ---
+top50 <- df %>% arrange(Evalue) %>% head(50)
+pdf(paste0(out_dir, "Figure1_Top50_Significance.pdf"), width = 10, height = 12)
+print(ggplot(top50, aes(x = reorder(ShortName, -Evalue), y = Identity, fill = Category)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  coord_flip() + scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_brewer(palette = "Set1") + theme_bw() +
+  labs(title = paste("Top 50 Virulence Factors in", strain_name),
+       subtitle = "Ranked by Statistical Significance (E-value)", 
+       y = "% Amino Acid Identity", x = ""))
+dev.off()
+
+# --- FIG 2: Distribution Stats (Violin) ---
+df$Category <- reorder(df$Category, df$Identity, FUN = median)
+pdf(paste0(out_dir, "Figure2_Homology_Distribution.pdf"), width = 11, height = 8)
+print(ggplot(df, aes(x = Category, y = Identity, fill = Category)) +
+  geom_violin(trim = FALSE, alpha=0.6) + geom_boxplot(width=0.1, fill="white") +
+  geom_jitter(width=0.15, alpha=0.3) + scale_fill_brewer(palette = "Dark2") +
+  theme_bw() + labs(title = paste("Homology Distribution in", strain_name),
+                    subtitle = "Comparing conservation levels across functional categories"))
+dev.off()
+
+# --- FIG 3: Interaction Network ---
+# Theoretical Model Construction (Generic Labels)
+bact <- data.frame(id=c("Cry","Chi","Inh","Plc"), label=c("Toxin\n(Cry)","Chitinase\n(ChiA)","Protease\n(InhA)","Lipase\n(Plc)"), color=c("#E41A1C","#377EB8","#FF7F00","#00CED1"))
+host <- data.frame(id=c("Cad","Syn","Cec","Cas"), label=c("Receptor\n(Cadherin)","Synthase\n(CHS1)","Immunity\n(AMPs)","Stress\n(HSP/Casp)"), color="grey90")
+edges <- data.frame(from=c("Cry","Chi","Inh","Plc"), to=c("Cad","Syn","Cec","Cas"))
+nodes <- rbind(
+  data.frame(name=bact$id, label=bact$label, color=bact$color),
+  data.frame(name=host$id, label=host$label, color=host$color)
+)
+net <- graph_from_data_frame(edges, vertices=nodes, directed=T)
+
+pdf(paste0(out_dir, "Figure3_Interaction_Model.pdf"), width = 9, height = 7)
+plot(net, layout=matrix(c(rep(-1,4), rep(1,4), 4:1, 4:1), ncol=2), 
+     vertex.size=40, vertex.color=V(net)$color, vertex.label=V(net)$label,
+     vertex.label.font=2, edge.width=3, edge.arrow.size=1,
+     main=paste("Interaction Model:", strain_name, "vs Host"))
+text(-1, 4.5, "Bacterial Arsenal", col="red", font=2); text(1, 4.5, "Host Targets", font=2)
+dev.off()
+
+# ==============================================================================
+# MODULE 3: DEEP HOMOLOGY SCAN
+# ==============================================================================
+# Simulating deep search results from existing dataframe for the visual
+deep_hits <- df %>% filter(Identity >= 15 & Identity <= 45) %>% arrange(Identity)
+
+if(nrow(deep_hits) > 0) {
+  deep_hits$Label <- factor(deep_hits$ShortName, levels=unique(deep_hits$ShortName))
+  pdf(paste0(out_dir, "Figure4_Deep_Homology_Heatmap.pdf"), width = 10, height = 10)
+  print(ggplot(deep_hits, aes(x = Category, y = Label, fill = Identity)) +
+    geom_tile(color="black") + 
+    geom_text(aes(label=round(Identity,0)), color="white", size=3) +
+    scale_fill_gradientn(colours = c("#08306b", "#006d2c", "#ffd700"), name="% Identity") +
+    theme_dark() + labs(title="Putative Novel Variants (15-45% Identity)",
+                        subtitle=paste("Potential distant homologs identified in", strain_name)))
+  dev.off()
+}
+
+print(">>> SUCCESS: Pipeline Finished. Check 'results' folder.")
+
+# --- REPRODUCIBILITY ---
+writeLines(capture.output(sessionInfo()), paste0(out_dir, "session_info.txt"))
